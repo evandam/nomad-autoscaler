@@ -1,14 +1,18 @@
 package policystorage
 
+import "time"
+
 type PolicyStorage interface {
 	List() ([]*PolicyListStub, error)
-	Get(string) (Policy, error)
+	Notify() (<-chan []*PolicyListStub, <-chan error)
+	Get(string) (*Policy, error)
 }
 
 type Policy struct {
 	ID       string
 	Source   string
 	Query    string
+	Interval time.Duration
 	Target   *Target
 	Strategy *Strategy
 }

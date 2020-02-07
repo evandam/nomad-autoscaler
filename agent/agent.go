@@ -6,7 +6,6 @@ import (
 	"os/exec"
 	"path"
 	"reflect"
-	"sync"
 	"time"
 
 	"github.com/hashicorp/go-hclog"
@@ -29,7 +28,7 @@ var (
 type Agent struct {
 	logger          hclog.Logger
 	config          *Config
-	nomadClient     *api.Client
+	ps              policystorage.PolicyStorage
 	apmPlugins      map[string]*Plugin
 	apmManager      *apmpkg.Manager
 	targetPlugins   map[string]*Plugin
@@ -65,9 +64,9 @@ func (a *Agent) Run(ctx context.Context) error {
 		return fmt.Errorf("failed to instantiate Nomad client: %v", err)
 	}
 
-	a.nomadClient = client
-
 	ps := policystorage.Nomad{Client: client}
+	logger := a.logger.With("policy_storage", reflect.TypeOf(ps))
+	a.ps = ps
 
 	// launch plugins
 	err = a.loadPlugins()
@@ -76,44 +75,48 @@ func (a *Agent) Run(ctx context.Context) error {
 	}
 
 	// loop like there's no tomorrow
-	var wg sync.WaitGroup
-	interval, _ := time.ParseDuration(a.config.ScanInterval)
-	ticker := time.NewTicker(interval)
+	policiesCn, errCn := ps.Notify()
+	policyMonitors := make(map[string]context.CancelFunc)
+
 Loop:
 	for {
 		select {
-		case <-ticker.C:
-			logger := a.logger.With("policy_storage", reflect.TypeOf(ps))
-			logger.Info("reading policies")
-
-			// read policies
-			policies, err := ps.List()
-			if err != nil {
-				logger.Error("failed to fetch policies", "error", err)
-				continue
-			}
+		case policies := <-policiesCn:
 			logger.Info(fmt.Sprintf("found %d policies", len(policies)))
 
 			// handle policies
 			for _, p := range policies {
-				wg.Add(1)
-				go func(ID string) {
-					defer wg.Done()
-					select {
-					case <-ctx.Done():
-						return
-					default:
-						policy, err := ps.Get(ID)
-						if err != nil {
-							logger.Error("failed to fetch policy", "policy_id", ID, "error", err)
-							return
-						}
-						a.handlePolicy(policy)
-					}
-				}(p.ID)
+				_, ok := policyMonitors[p.ID]
+				if ok {
+					continue
+				}
+
+				policyCtx, cancel := context.WithCancel(ctx)
+				go a.monitorPolicy(policyCtx, p.ID)
+				policyMonitors[p.ID] = cancel
 			}
-			wg.Wait()
+
+			// cancel old policies
+			for ID, cancel := range policyMonitors {
+				found := false
+				for _, p := range policies {
+					if p.ID == ID {
+						found = true
+						break
+					}
+				}
+				if !found {
+					cancel()
+				}
+			}
+		case err := <-errCn:
+			logger.Error("failed to fetch policies", "error", err)
 		case <-ctx.Done():
+			// stop policy check goroutines
+			for _, cancel := range policyMonitors {
+				go cancel()
+			}
+
 			// stop plugins before exiting
 			a.logger.Info("killing plugins")
 			a.apmManager.Kill()
@@ -253,6 +256,42 @@ func (a *Agent) loadStrategyPlugins() error {
 		}
 	}
 	return nil
+}
+
+func (a *Agent) monitorPolicy(ctx context.Context, ID string) {
+	logger := a.logger.Named("policy-monitor").With("policy_id", ID)
+	logger.Info("start monitoring policy")
+
+	defaultSleep, err := time.ParseDuration(a.config.ScanInterval)
+	if err != nil {
+		defaultSleep = 5 * time.Second
+	}
+
+	ticker := time.NewTicker(defaultSleep)
+
+	for {
+		select {
+		case <-ctx.Done():
+			logger.Info("stopped policy check")
+			return
+		case <-ticker.C:
+			policy, err := a.ps.Get(ID)
+			if err != nil {
+				logger.Error("failed to fetch policy", "error", err)
+				continue
+			}
+
+			// hack to update tick duration
+			sleepDuration := defaultSleep
+			if policy.Interval != 0 {
+				sleepDuration = policy.Interval
+			}
+			ticker.Stop()
+			ticker = time.NewTicker(sleepDuration)
+
+			a.handlePolicy(policy)
+		}
+	}
 }
 
 func (a *Agent) handlePolicy(p *policystorage.Policy) {

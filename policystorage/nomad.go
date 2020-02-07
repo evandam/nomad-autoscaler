@@ -3,6 +3,7 @@ package policystorage
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/hashicorp/nomad/api"
 )
@@ -11,24 +12,32 @@ type Nomad struct {
 	Client *api.Client
 }
 
-func (n *Nomad) List() ([]*PolicyListStub, error) {
-	fromPolicies, _, err := n.Client.Scaling().ListPolicies(nil)
-	if err != nil {
-		return nil, err
-	}
-
-	var toPolicies []*PolicyListStub
-	for _, policy := range fromPolicies {
-		toPolicy := &PolicyListStub{
-			ID: policy.ID,
-		}
-		toPolicies = append(toPolicies, toPolicy)
-	}
-
-	return toPolicies, nil
+func (n Nomad) List() ([]*PolicyListStub, error) {
+	p, _, err := n.policies(nil)
+	return p, err
 }
 
-func (n *Nomad) Get(ID string) (*Policy, error) {
+func (n Nomad) Notify() (<-chan []*PolicyListStub, <-chan error) {
+	var index uint64
+	out := make(chan []*PolicyListStub)
+	errCn := make(chan error)
+
+	go func() {
+		for {
+			policies, qm, err := n.policies(&api.QueryOptions{WaitIndex: index})
+			if err != nil {
+				errCn <- err
+				continue
+			}
+			index = qm.LastIndex
+			out <- policies
+		}
+	}()
+
+	return out, errCn
+}
+
+func (n Nomad) Get(ID string) (*Policy, error) {
 	fromPolicy, _, err := n.Client.Scaling().GetPolicy(ID, nil)
 	if err != nil {
 		return nil, err
@@ -42,15 +51,41 @@ func (n *Nomad) Get(ID string) (*Policy, error) {
 	if fromPolicy.Policy["source"] == nil {
 		fromPolicy.Policy["source"] = ""
 	}
+
+	var interval time.Duration
+	if fromPolicy.Policy["interval"] != nil && fromPolicy.Policy["interval"] != "" {
+		interval, err = time.ParseDuration(fromPolicy.Policy["interval"].(string))
+		if err != nil {
+			return nil, err
+		}
+	}
 	toPolicy := &Policy{
 		ID:       fromPolicy.ID,
 		Source:   fromPolicy.Policy["source"].(string),
 		Query:    fromPolicy.Policy["query"].(string),
+		Interval: interval,
 		Strategy: parseStrategy(fromPolicy.Policy["strategy"]),
 		Target:   parseTarget(fromPolicy.Policy["target"]),
 	}
 	canonicalize(fromPolicy, toPolicy)
 	return toPolicy, nil
+}
+
+func (n Nomad) policies(q *api.QueryOptions) ([]*PolicyListStub, *api.QueryMeta, error) {
+	fromPolicies, qm, err := n.Client.Scaling().ListPolicies(q)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	var toPolicies []*PolicyListStub
+	for _, policy := range fromPolicies {
+		toPolicy := &PolicyListStub{
+			ID: policy.ID,
+		}
+		toPolicies = append(toPolicies, toPolicy)
+	}
+
+	return toPolicies, qm, nil
 }
 
 func canonicalize(from *api.ScalingPolicy, to *Policy) {
